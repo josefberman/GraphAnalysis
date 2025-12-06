@@ -2,8 +2,11 @@ import numpy as np
 import pandas as pd
 import lightgbm as lgb
 from scipy import sparse
-from sklearn.metrics import roc_auc_score, mean_squared_error, classification_report
+from sklearn.metrics import roc_auc_score, mean_squared_error
 import gc
+import argparse
+import sys
+import os
 
 # ==========================================
 # 1. Core Vectorized Graph Algorithms
@@ -45,8 +48,6 @@ def calculate_adamic_adar_vectorized(adj_matrix, u_nodes, v_nodes, batch_size=10
     # We multiply the adjacency matrix by the diagonal weight matrix
     # Note: To match AA definition, weights apply to the shared neighbor 'w'
     adj_weighted = adj_matrix.dot(D_diag)
-    
-    print(f"Starting Adamic-Adar calculation for {n_pairs} pairs...")
     
     # 3. Process in batches to save RAM (Vectorized Row-wise Dot Product)
     for i in range(0, n_pairs, batch_size):
@@ -92,7 +93,8 @@ def build_features(u_nodes, v_nodes, graph_csr, node_props, degrees, weight_stat
     Args:
         u_nodes, v_nodes: Arrays of node IDs.
         graph_csr: Sparse adjacency matrix (symmetric/undirected for topology).
-        node_props: Array where index = node_ID, value = category_code.
+        node_props: DataFrame where index = node_ID.
+                   Columns are multiple features.
         degrees: Pre-calculated degrees of nodes.
         weight_stats (dict, optional): Contains 'sum_out', 'sum_in', 'global_avg' for weight features.
         
@@ -108,20 +110,34 @@ def build_features(u_nodes, v_nodes, graph_csr, node_props, degrees, weight_stat
     # Assumes graph_csr is symmetrized for this calculation as recommended
     feat_adamic = calculate_adamic_adar_vectorized(graph_csr, u_nodes, v_nodes)
     
-    # --- Node Property Features ---
-    
-    # 3. Categorical Match & Raw Categories
-    u_cats = node_props[u_nodes]
-    v_cats = node_props[v_nodes]
-    feat_same_cat = (u_cats == v_cats).astype(int)
-    
     feature_dict = {
         'pref_attach': feat_pref_attach,
         'adamic_adar': feat_adamic,
-        'cat_u': u_cats,
-        'cat_v': v_cats,
-        'same_cat': feat_same_cat,
     }
+    
+    # --- Node Property Features ---
+    if isinstance(node_props, pd.DataFrame):
+        # Assume node_props is indexed by node_id 0..N
+        # We need to extract features for u and v
+        
+        # For each column in node_props, create u_feature, v_feature, and interaction
+        for col in node_props.columns:
+            if col == 'node_id': continue
+            
+            # Extract raw values
+            u_vals = node_props.loc[u_nodes, col].values
+            v_vals = node_props.loc[v_nodes, col].values
+            
+            feature_dict[f'u_{col}'] = u_vals
+            feature_dict[f'v_{col}'] = v_vals
+            
+            # Interaction: If numeric, maybe diff? If categorical, maybe match?
+            # For now, simple equality check (works for both)
+            # Convert to numeric for LightGBM if needed, but LGBM handles categorical integers well
+            feature_dict[f'same_{col}'] = (u_vals == v_vals).astype(int)
+    else:
+        print("Error: node_props is not a DataFrame. Feature extraction requires a DataFrame.")
+        sys.exit(1)
 
     # --- Weight/Activity Features (for Stage 2 or enhanced Stage 1) ---
     if weight_stats:
@@ -201,45 +217,195 @@ def generate_negatives(num_neg, num_nodes, existing_edge_set):
 # 3. Main Pipeline
 # ==========================================
 
-def run_pipeline(num_nodes=60000, num_edges=1800000):
-    print(f"--- Initializing Graph with {num_nodes} nodes and ~{num_edges} edges ---")
+def predict_all_unknown_edges(num_nodes, existing_edge_set, graph_csr_sym, node_props, degrees, weight_stats, model_existence, model_weight, output_file="predicted_edges.csv", threshold=0.5):
+    """
+    Iterates through ALL possible non-edges in the graph and predicts their probability and weight.
+    Writes results directly to a CSV to avoid memory issues.
+    """
+    print(f"\n--- Starting Full Graph Prediction (Unknown Edges Only) ---")
+    print(f"Total possible pairs: {num_nodes * num_nodes}")
+    print(f"Targeting output file: {output_file}")
+    
+    # Open file and write header
+    with open(output_file, 'w') as f:
+        # Determine header from a dummy feature construction to get column names correct
+        dummy_u = np.array([0])
+        dummy_v = np.array([1])
+        # We output u, v, prob, pred_weight. We don't output features to save space.
+        f.write("u,v,prob_exists,pred_weight\n")
+    
+    # Parameters for batching
+    # We iterate over source nodes in chunks
+    source_batch_size = 100  # Small batch of source nodes
+    
+    all_nodes = np.arange(num_nodes)
+    
+    # Stats
+    total_predictions = 0
+    edges_found = 0
+    
+    # Iterate over all source nodes u
+    for u_start in range(0, num_nodes, source_batch_size):
+        u_end = min(u_start + source_batch_size, num_nodes)
+        u_batch = np.arange(u_start, u_end)
+        
+        # For each source node in this small batch, we want to check ALL target nodes
+        # But to be efficient, we can create a grid
+        # Grid size: source_batch_size * num_nodes (e.g., 100 * 60,000 = 6M pairs)
+        # This fits in memory for feature construction
+        
+        # Repeat u for each v
+        u_grid = np.repeat(u_batch, num_nodes)
+        # Tile v for each u
+        v_grid = np.tile(all_nodes, len(u_batch))
+        
+        # --- Filtering ---
+        # 1. Filter self-loops
+        mask_loops = u_grid != v_grid
+        u_cand = u_grid[mask_loops]
+        v_cand = v_grid[mask_loops]
+        
+        # 2. Filter existing edges
+        cand_ids = u_cand.astype(np.int64) * num_nodes + v_cand
+        
+        # Efficient boolean mask using set
+        # Note: list comp is fast enough for checking existence
+        mask_unknown = np.array([cid not in existing_edge_set for cid in cand_ids])
+        
+        u_final = u_cand[mask_unknown]
+        v_final = v_cand[mask_unknown]
+        
+        if len(u_final) == 0:
+            continue
+            
+        # --- Prediction ---
+        # Build features
+        X_batch = build_features(u_final, v_final, graph_csr_sym, node_props, degrees, weight_stats)
+        
+        # Predict Existence
+        probs = model_existence.predict_proba(X_batch)[:, 1]
+        
+        # Filter by threshold to save disk space and time
+        mask_likely = probs > threshold
+        
+        if np.sum(mask_likely) > 0:
+            u_likely = u_final[mask_likely]
+            v_likely = v_final[mask_likely]
+            probs_likely = probs[mask_likely]
+            X_likely = X_batch[mask_likely]
+            
+            # Predict Weight for likely edges
+            weights_log = model_weight.predict(X_likely)
+            weights_real = np.expm1(weights_log)
+            
+            # Write to file
+            # Use pandas for easy CSV formatting of chunk
+            df_results = pd.DataFrame({
+                'u': u_likely,
+                'v': v_likely,
+                'prob_exists': probs_likely,
+                'pred_weight': weights_real
+            })
+            
+            df_results.to_csv(output_file, mode='a', header=False, index=False)
+            edges_found += len(df_results)
+            
+        total_predictions += len(u_final)
+        
+        if u_end % 1000 == 0:
+            print(f"Processed nodes up to {u_end}/{num_nodes}. Found {edges_found} potential edges so far...")
+            gc.collect() # Force garbage collection
+            
+    print(f"\nFinished. Scanned {total_predictions} unknown pairs.")
+    print(f"Found {edges_found} edges above probability threshold {threshold}.")
+    print(f"Results saved to {output_file}")
+
+def run_pipeline(input_csv=None, features_csv=None, output_csv="predicted_edges.csv", threshold=0.5):
+    num_nodes = 60000 # Default
     
     # -------------------------------------------------------
-    # A. Synthetic Data Generation (Replace with real data loading)
+    # A. Data Loading
     # -------------------------------------------------------
-    # Random edges
-    sources = np.random.randint(0, num_nodes, num_edges)
-    targets = np.random.randint(0, num_nodes, num_edges)
-    # Remove self-loops
-    mask = sources != targets
-    sources = sources[mask]
-    targets = targets[mask]
-    
-    # Random weights (Power law-ish: most are 1, some are high)
-    weights = np.random.zipf(2.0, size=len(sources))
-    
-    # Random Node Properties (Categorical, e.g., 3 categories)
-    node_props = np.random.randint(0, 3, num_nodes)
-    
-    # Create dataframe
-    df_edges = pd.DataFrame({'u': sources, 'v': targets, 'weight': weights})
-    
-    # Deduplicate edges (keep first or sum weights - simplified here to keep first)
+    df_edges = None
+    if input_csv:
+        print(f"--- Loading Data from {input_csv} ---")
+        try:
+            # Assume standard columns or first 3 columns are u, v, weight
+            df_edges = pd.read_csv(input_csv)
+            
+            # Standardize column names
+            if len(df_edges.columns) >= 3:
+                df_edges.columns = ['u', 'v', 'weight'] + list(df_edges.columns[3:])
+            else:
+                print("Error: Input CSV must have at least 3 columns (u, v, weight)")
+                sys.exit(1)
+
+            # Remap node IDs check
+            max_id = max(df_edges['u'].max(), df_edges['v'].max())
+            if max_id >= 60000:
+                num_nodes = max_id + 1
+                print(f"Detected {num_nodes} nodes from input file.")
+                
+        except Exception as e:
+            print(f"Failed to read CSV: {e}")
+            sys.exit(1)
+    else:
+        print("Error: Input CSV file (--input) is required. Synthetic generation has been disabled.")
+        sys.exit(1)
+
+    # Clean up duplicates
     df_edges = df_edges.drop_duplicates(subset=['u', 'v'])
-    print(f"Final edges after cleanup: {len(df_edges)}")
+    print(f"Final edges count: {len(df_edges)}")
     
+    # -------------------------------------------------------
+    # A.2 Feature Loading
+    # -------------------------------------------------------
+    node_props = None
+    cat_features = []
+    
+    if features_csv:
+        print(f"--- Loading Node Features from {features_csv} ---")
+        try:
+            df_features = pd.read_csv(features_csv)
+            # Expecting: node_id, feat1, feat2...
+            # Ensure node_id matches our node indices
+            if 'node_id' not in df_features.columns:
+                 # assume first column is node_id if not explicit
+                 df_features.rename(columns={df_features.columns[0]: 'node_id'}, inplace=True)
+            
+            # Index by node_id for fast lookups
+            # We reindex to ensure we have a row for every node 0..num_nodes-1
+            # Fill missing nodes with 0 or -1 (handling as categorical or default)
+            df_features.set_index('node_id', inplace=True)
+            
+            # Reindex to full range 0 to num_nodes-1
+            # This ensures df_features.loc[0] works even if 0 was missing in file
+            df_features = df_features.reindex(range(num_nodes), fill_value=0)
+            
+            node_props = df_features
+            print(f"Loaded features for {len(node_props)} nodes. Columns: {list(node_props.columns)}")
+            
+            # Identify categorical columns for LightGBM
+            # Construct feature names: u_col, v_col, same_col
+            for col in node_props.columns:
+                cat_features.extend([f'u_{col}', f'v_{col}', f'same_{col}'])
+            
+        except Exception as e:
+            print(f"Failed to read Features CSV: {e}")
+            sys.exit(1)
+    else:
+        print("Error: Node features CSV file (--features) is required. Synthetic generation has been disabled.")
+        sys.exit(1)
+
     # --- Create Set of Existing Edges for Fast Lookup ---
-    # Using integer encoding: u * num_nodes + v for memory efficiency and speed
-    print("Indexing existing edges for negative sampling...")
+    print("Indexing existing edges...")
     existing_edge_set = set(df_edges['u'].values.astype(np.int64) * num_nodes + df_edges['v'].values)
 
     # -------------------------------------------------------
     # B. Data Splitting (Edge Masking)
     # -------------------------------------------------------
     print("\n--- Splitting Data (Edge Masking) ---")
-    # Mask 20% of existing edges for validation/testing of "Existence"
     mask_test = np.random.rand(len(df_edges)) < 0.2
-    
     df_train_pos = df_edges[~mask_test].copy()
     df_test_pos = df_edges[mask_test].copy()
     
@@ -249,30 +415,23 @@ def run_pipeline(num_nodes=60000, num_edges=1800000):
     # -------------------------------------------------------
     # C. Sparse Matrix Creation (CSR)
     # -------------------------------------------------------
-    # Create CSR from TRAINING edges only (to avoid leakage)
     row = df_train_pos['u'].values
     col = df_train_pos['v'].values
-    data = np.ones(len(df_train_pos)) # Binary for topology
+    data = np.ones(len(df_train_pos)) 
     
-    # Directed Graph for specific directed features if needed
     graph_csr_directed = sparse.csr_matrix((data, (row, col)), shape=(num_nodes, num_nodes))
     
-    # Symmetrized Graph for Adamic-Adar (Topology)
-    # Note: This sums weights if edges exist in both directions, but we just need non-zero structure
+    # Symmetrized Graph for Topology
     graph_csr_sym = graph_csr_directed + graph_csr_directed.T
-    graph_csr_sym.data = np.ones_like(graph_csr_sym.data) # Binarize
+    graph_csr_sym.data = np.ones_like(graph_csr_sym.data) 
     
-    # Pre-calculate degrees (from symmetric graph usually best for undirected metrics)
     degrees = np.array(graph_csr_sym.sum(axis=1)).flatten()
     
-    # Pre-calculate Weight Statistics for Bayesian Smoothing
-    # Using directed graph weights
-    # Create weighted CSR
+    # Weight Statistics
     weights_train = df_train_pos['weight'].values
     graph_csr_weighted = sparse.csr_matrix((weights_train, (row, col)), shape=(num_nodes, num_nodes))
     
     sum_out = np.array(graph_csr_weighted.sum(axis=1)).flatten()
-    # For sum_in, we transpose
     sum_in = np.array(graph_csr_weighted.T.sum(axis=1)).flatten()
     global_avg_weight = np.mean(weights_train)
     
@@ -283,7 +442,7 @@ def run_pipeline(num_nodes=60000, num_edges=1800000):
     }
 
     # -------------------------------------------------------
-    # D. Negative Sampling (Smart Ratio 1:5)
+    # D. Negative Sampling 
     # -------------------------------------------------------
     print("\n--- Negative Sampling (with filtering) ---")
     num_pos = len(df_train_pos)
@@ -292,71 +451,33 @@ def run_pipeline(num_nodes=60000, num_edges=1800000):
     neg_u, neg_v = generate_negatives(num_neg, num_nodes, existing_edge_set)
     
     # -------------------------------------------------------
-    # E. Feature Construction (Train Set)
+    # E. Feature Construction & Training
     # -------------------------------------------------------
     print("\n--- Building Training Features ---")
-    
-    # Positive Samples
-    X_pos = build_features(
-        df_train_pos['u'].values, 
-        df_train_pos['v'].values, 
-        graph_csr_sym, 
-        node_props,
-        degrees,
-        weight_stats
-    )
+    X_pos = build_features(df_train_pos['u'].values, df_train_pos['v'].values, graph_csr_sym, node_props, degrees, weight_stats)
     y_pos = np.ones(len(X_pos))
     
-    # Negative Samples
-    X_neg = build_features(
-        neg_u, 
-        neg_v, 
-        graph_csr_sym, 
-        node_props,
-        degrees,
-        weight_stats
-    )
+    X_neg = build_features(neg_u, neg_v, graph_csr_sym, node_props, degrees, weight_stats)
     y_neg = np.zeros(len(X_neg))
     
-    # Combine
     X_train = pd.concat([X_pos, X_neg], ignore_index=True)
     y_train = np.concatenate([y_pos, y_neg])
     
-    # Weights for regression (only for positives)
-    y_train_weights = df_train_pos['weight'].values
-    # Log transform targets
-    y_train_weights_log = np.log1p(y_train_weights)
+    y_train_weights_log = np.log1p(df_train_pos['weight'].values)
     
-    # Categorical features indices for LightGBM
-    cat_features = ['cat_u', 'cat_v', 'same_cat']
-    
-    # -------------------------------------------------------
-    # F. Stage 1: Existence Model (Classification)
-    # -------------------------------------------------------
     print("\n--- Training Stage 1: Link Prediction (LightGBM) ---")
+    # Note: LightGBM ignores columns in categorical_feature that aren't in input
+    # but it's safer to check intersection if needed. 
+    # Here we assume features constructed are present.
+    model_existence = lgb.LGBMClassifier(objective='binary', n_estimators=500, learning_rate=0.05, num_leaves=31, n_jobs=-1)
+    model_existence.fit(X_train, y_train, categorical_feature=cat_features)
     
-    model_existence = lgb.LGBMClassifier(
-        objective='binary',
-        n_estimators=500,
-        learning_rate=0.05,
-        num_leaves=31,
-        n_jobs=-1
-    )
-    
-    model_existence.fit(
-        X_train, y_train,
-        categorical_feature=cat_features
-    )
-    
-    # Validate on Test Set (Positives + Random Negatives)
     print("\n--- Validating... ---")
-    # Generate test negatives
+    # Quick validation
     num_test_neg = len(df_test_pos)
     test_neg_u, test_neg_v = generate_negatives(num_test_neg, num_nodes, existing_edge_set)
-    
     X_test_pos = build_features(df_test_pos['u'].values, df_test_pos['v'].values, graph_csr_sym, node_props, degrees, weight_stats)
     X_test_neg = build_features(test_neg_u, test_neg_v, graph_csr_sym, node_props, degrees, weight_stats)
-    
     X_test = pd.concat([X_test_pos, X_test_neg], ignore_index=True)
     y_test = np.concatenate([np.ones(len(X_test_pos)), np.zeros(len(X_test_neg))])
     
@@ -364,69 +485,26 @@ def run_pipeline(num_nodes=60000, num_edges=1800000):
     auc = roc_auc_score(y_test, probs)
     print(f"Stage 1 ROC-AUC: {auc:.4f}")
 
-    # -------------------------------------------------------
-    # G. Stage 2: Property Model (Weight Regression)
-    # -------------------------------------------------------
     print("\n--- Training Stage 2: Weight Prediction (LightGBM Regressor) ---")
-    
-    # Train ONLY on positive examples
-    # X_pos corresponds to df_train_pos
-    
-    model_weight = lgb.LGBMRegressor(
-        objective='regression',
-        metric='rmse',
-        n_estimators=500,
-        learning_rate=0.05,
-        num_leaves=31,
-        n_jobs=-1
-    )
-    
-    model_weight.fit(
-        X_pos, y_train_weights_log,
-        categorical_feature=cat_features
-    )
-    
-    # Evaluate on Test Positives
-    y_test_weights_log = np.log1p(df_test_pos['weight'].values)
-    preds_log = model_weight.predict(X_test_pos)
-    
-    # Calculate RMSLE (on log scale)
-    rmsle = np.sqrt(mean_squared_error(y_test_weights_log, preds_log))
-    print(f"Stage 2 RMSLE (Log Scale Error): {rmsle:.4f}")
+    model_weight = lgb.LGBMRegressor(objective='regression', metric='rmse', n_estimators=500, learning_rate=0.05, num_leaves=31, n_jobs=-1)
+    model_weight.fit(X_pos, y_train_weights_log, categorical_feature=cat_features)
     
     # -------------------------------------------------------
-    # H. Integrated Inference Example
+    # H. Full Graph Prediction (All Unknown Edges)
     # -------------------------------------------------------
-    print("\n--- Inference Example on New Pairs ---")
-    # Simulate 5 candidates
-    cand_u = np.random.randint(0, num_nodes, 500*500)
-    cand_v = np.random.randint(0, num_nodes, 500*500)
-    
-    X_cand = build_features(cand_u, cand_v, graph_csr_sym, node_props, degrees, weight_stats)
-    
-    # 1. Predict Existence
-    exist_probs = model_existence.predict_proba(X_cand)[:, 1]
-    
-    # 2. Predict Weight (for all, but we'd usually filter)
-    weight_preds_log = model_weight.predict(X_cand)
-    weight_preds_real = np.expm1(weight_preds_log)
-    
-    results = pd.DataFrame({
-        'u': cand_u,
-        'v': cand_v,
-        'prob_exists': exist_probs,
-        'pred_weight': weight_preds_real
-    })
-    
-    # Filter by threshold
-    threshold = 0.5
-    likely_edges = results[results['prob_exists'] > threshold]
-    
-    print("All Candidates Predictions:")
-    print(results)
-    print(f"\nLikely Edges (Threshold > {threshold}):")
-    print(likely_edges)
+    predict_all_unknown_edges(
+        num_nodes, existing_edge_set, graph_csr_sym, node_props, 
+        degrees, weight_stats, model_existence, model_weight, 
+        output_file=output_csv, threshold=threshold
+    )
 
 if __name__ == "__main__":
-    # Run the full pipeline
-    run_pipeline()
+    parser = argparse.ArgumentParser(description='Graph Link Prediction & Weight Regression Pipeline')
+    parser.add_argument('--input', type=str, help='Path to input CSV file (columns: u, v, weight)', default=None)
+    parser.add_argument('--features', type=str, help='Path to node features CSV file (columns: node_id, feat1, feat2...)', default=None)
+    parser.add_argument('--output', type=str, help='Path to output CSV file for predictions', default='predicted_edges.csv')
+    parser.add_argument('--threshold', type=float, help='Probability threshold for saving predicted edges', default=0.5)
+    
+    args = parser.parse_args()
+    
+    run_pipeline(input_csv=args.input, features_csv=args.features, output_csv=args.output, threshold=args.threshold)
